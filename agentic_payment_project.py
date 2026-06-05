@@ -745,6 +745,7 @@ class OrchestratorAgent:
     def run(self, message: str, **kwargs: Any) -> AgentResult:
         intent = message if message in ToolSelector.MAP else self.router.route(message).output
         selected_tool = self.tool_selector.select(intent).output
+        internal_parameters = self._internal_parameters_for_intent(intent, kwargs)
 
         if selected_tool == "FallbackAgent":
             result = self.fallback_agent.handle(message)
@@ -790,6 +791,10 @@ class OrchestratorAgent:
         if critic.output["needs_fallback"]:
             result = self.fallback_agent.handle(message)
 
+        result.metadata = {
+            **(result.metadata or {}),
+            "parameters": internal_parameters,
+        }
         self.memory.update(
             intent,
             result,
@@ -802,6 +807,30 @@ class OrchestratorAgent:
             {"message": message, "intent": intent, "tool": selected_tool, "agent": result.agent_name},
         )
         return result
+
+    @staticmethod
+    def _internal_parameters_for_intent(intent: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        fields_by_intent = {
+            "createUser": ["name", "phone_number", "initial_balance"],
+            "checkBalance": ["user_id"],
+            "transferMoney": ["sender_id", "receiver_id", "amount"],
+            "requestPayment": ["requester_id", "payer_id", "amount"],
+            "approvePayment": ["request_id"],
+            "rejectPayment": ["request_id"],
+            "showTransactions": ["user_id"],
+            "fraudCheck": [],
+            "securityReview": [],
+            "explainLastAction": [],
+        }
+        parameters = {
+            field_name: kwargs[field_name]
+            for field_name in fields_by_intent.get(intent, [])
+            if field_name in kwargs
+        }
+        for numeric_field in ("amount", "initial_balance"):
+            if numeric_field in parameters:
+                parameters[numeric_field] = float(parameters[numeric_field])
+        return parameters
 
     @staticmethod
     def _last_user_from_kwargs(kwargs: Dict[str, Any]) -> Optional[str]:
