@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import json
 import os
 import re
-
+from openai import OpenAI
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -39,11 +39,9 @@ class OpenAIChatbot:
             return
 
         try:
-            from openai import OpenAI
-
             self.client = OpenAI(api_key=api_key)
             self.enabled = True
-        except Exception:
+        except Exception as e:
             self.client = None
             self.enabled = False
 
@@ -149,7 +147,7 @@ class ShortTermMemory:
                 "result": result.output,
             }
         )
-        self.recent_actions = self.recent_actions[-self.limit :]
+        self.recent_actions = self.recent_actions[-self.limit:]
 
 
 class PaymentSystem:
