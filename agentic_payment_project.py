@@ -7,7 +7,19 @@ from typing import Any, Dict, List, Optional
 import json
 import os
 import re
+import sys
 from openai import OpenAI
+
+try:
+    from agents import Agent as OpenAIAgent
+    from agents import Runner as OpenAIAgentRunner
+    from agents import function_tool
+except ImportError:
+    OpenAIAgent = None
+    OpenAIAgentRunner = None
+
+    def function_tool(func):
+        return func
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -384,10 +396,17 @@ class FreeSpeechParserAgent:
 
     def parse(self, message: str, memory: Optional[ShortTermMemory] = None) -> AgentResult:
         parsed = self._parse_with_openai(message)
-        if parsed is None:
+        if parsed is None or parsed.intent == "unknown":
             parsed = self._parse_locally(message, memory)
 
         parsed.missing_fields = self._missing_fields(parsed)
+        if parsed.missing_fields:
+            local_parsed = self._parse_locally(message, memory)
+            local_parsed.missing_fields = self._missing_fields(local_parsed)
+            if local_parsed.intent == parsed.intent and len(local_parsed.missing_fields) < len(parsed.missing_fields):
+                parsed.parameters = {**local_parsed.parameters, **parsed.parameters}
+                parsed.missing_fields = self._missing_fields(parsed)
+
         return AgentResult(
             "FreeSpeechParserAgent",
             {
@@ -707,6 +726,244 @@ class FallbackAgent:
         )
 
 
+class OpenAIAgentRuntime:
+    """OpenAI Agents SDK runtime used for primary natural-language inference."""
+
+    def __init__(
+        self,
+        payment_system: PaymentSystem,
+        memory: ShortTermMemory,
+        policy_agent: PolicyAgent,
+        fraud_agent: FraudDetectionAgent,
+        security_agent: SecurityAgent,
+        explanation_agent: ExplanationAgent,
+        fallback_agent: FallbackAgent,
+        model: Optional[str] = None,
+    ):
+        load_env_file()
+        self.enabled = bool(os.getenv("OPENAI_API_KEY", "").strip()) and sys.version_info >= (3, 10) and OpenAIAgent is not None
+        self.model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+        self.payment_system = payment_system
+        self.memory = memory
+        self.policy_agent = policy_agent
+        self.fraud_agent = fraud_agent
+        self.security_agent = security_agent
+        self.explanation_agent = explanation_agent
+        self.fallback_agent = fallback_agent
+        self.tool_results: List[AgentResult] = []
+        self.primary_result: Optional[AgentResult] = None
+        self.agents: Dict[str, Any] = {}
+        self.disabled_reason = self._disabled_reason()
+
+        if self.enabled:
+            self._build_agents()
+
+    def _disabled_reason(self) -> Optional[str]:
+        if not os.getenv("OPENAI_API_KEY", "").strip():
+            return "missing OPENAI_API_KEY"
+        if sys.version_info < (3, 10):
+            return "OpenAI Agents SDK requires Python 3.10 or newer"
+        if OpenAIAgent is None:
+            return "openai-agents package is not installed"
+        return None
+
+    def run(self, message: str) -> AgentResult:
+        if not self.enabled:
+            raise RuntimeError("OpenAI Agents SDK runtime is not available.")
+
+        self.tool_results = []
+        self.primary_result = None
+        result = OpenAIAgentRunner.run_sync(self.agents["intake"], message)
+        final_text = str(getattr(result, "final_output", "")).strip()
+
+        if self.primary_result is not None:
+            output = self.primary_result
+        elif self.tool_results:
+            output = self.tool_results[-1]
+        else:
+            output = AgentResult("OpenAIAgentRuntime", final_text, 0.85)
+
+        output.metadata = {
+            **(output.metadata or {}),
+            "sdk_final_output": final_text,
+            "inference": "openai_agents_sdk",
+            "handoffs": self._handoff_names(),
+        }
+        return output
+
+    def _record(self, result: AgentResult, primary: bool = False) -> Dict[str, Any]:
+        self.tool_results.append(result)
+        if primary or self.primary_result is None:
+            self.primary_result = result
+        return compact(result)
+
+    def _handoff_names(self) -> List[str]:
+        return [result.agent_name for result in self.tool_results]
+
+    @staticmethod
+    def _transaction_from_result(result: Optional[AgentResult]) -> Optional[Transaction]:
+        if result is None:
+            return None
+        metadata = result.metadata or {}
+        tx_data = metadata.get("transaction")
+        if not tx_data and isinstance(result.output, dict):
+            tx_data = result.output.get("transaction")
+        if isinstance(tx_data, dict):
+            return Transaction(**tx_data)
+        return None
+
+    def _build_agents(self) -> None:
+        @function_tool
+        def create_user(name: str, phone_number: str, initial_balance: float = 0) -> Dict[str, Any]:
+            """Create a new wallet user."""
+            return self._record(self.payment_system.create_user(name, phone_number, initial_balance), primary=True)
+
+        @function_tool
+        def check_balance(user_id: str) -> Dict[str, Any]:
+            """Return a user's current wallet balance."""
+            return self._record(self.payment_system.get_balance(user_id), primary=True)
+
+        @function_tool
+        def transfer_money(sender_id: str, receiver_id: str, amount: float) -> Dict[str, Any]:
+            """Execute a transfer after policy approval."""
+            return self._record(self.payment_system.transfer_money(sender_id, receiver_id, amount), primary=True)
+
+        @function_tool
+        def request_payment(requester_id: str, payer_id: str, amount: float) -> Dict[str, Any]:
+            """Create a payment request from requester to payer."""
+            return self._record(self.payment_system.request_payment(requester_id, payer_id, amount), primary=True)
+
+        @function_tool
+        def approve_payment_request(request_id: str) -> Dict[str, Any]:
+            """Approve an existing payment request."""
+            return self._record(self.payment_system.approve_payment_request(request_id), primary=True)
+
+        @function_tool
+        def reject_payment_request(request_id: str) -> Dict[str, Any]:
+            """Reject an existing payment request."""
+            return self._record(self.payment_system.reject_payment_request(request_id), primary=True)
+
+        @function_tool
+        def show_transactions(user_id: str) -> Dict[str, Any]:
+            """Show transactions involving one user."""
+            return self._record(self.payment_system.get_transactions(user_id), primary=True)
+
+        @function_tool
+        def check_transfer_policy(sender_id: str, amount: float) -> Dict[str, Any]:
+            """Check transfer policy before a transfer is executed."""
+            result = self.policy_agent.check_transfer(sender_id, amount, self.payment_system)
+            return self._record(result, primary=result.output != "Policy approved.")
+
+        @function_tool
+        def review_last_transaction() -> Dict[str, Any]:
+            """Review the latest transaction for fraud risk."""
+            transaction = self._transaction_from_result(self.primary_result) or self.memory.last_transaction
+            result = self.fraud_agent.review(transaction, self.payment_system)
+            if self.primary_result is not None:
+                self.primary_result.metadata = {
+                    **(self.primary_result.metadata or {}),
+                    "fraud_check": result.output,
+                }
+            return self._record(result, primary=False)
+
+        @function_tool
+        def run_security_review() -> Dict[str, Any]:
+            """Run a security review of the payment system state."""
+            return self._record(self.security_agent.review(self.payment_system), primary=True)
+
+        @function_tool
+        def explain_last_action() -> Dict[str, Any]:
+            """Explain the latest remembered business action."""
+            return self._record(self.explanation_agent.explain(self.memory), primary=True)
+
+        @function_tool
+        def fallback_response(original_message: str) -> Dict[str, Any]:
+            """Return a fallback response when the request is unsupported or ambiguous."""
+            return self._record(self.fallback_agent.handle(original_message), primary=True)
+
+        fraud_agent = OpenAIAgent(
+            name="FraudDetectionAgent",
+            model=self.model,
+            instructions=(
+                "You review only completed or recent transactions for fraud risk. "
+                "Call review_last_transaction, then summarize the risk briefly."
+            ),
+            tools=[review_last_transaction],
+        )
+        security_agent = OpenAIAgent(
+            name="SecurityAgent",
+            model=self.model,
+            instructions="You run system security reviews. Call run_security_review.",
+            tools=[run_security_review],
+        )
+        explanation_agent = OpenAIAgent(
+            name="ExplanationAgent",
+            model=self.model,
+            instructions="You explain the latest remembered action. Call explain_last_action.",
+            tools=[explain_last_action],
+        )
+        fallback_agent = OpenAIAgent(
+            name="FallbackAgent",
+            model=self.model,
+            instructions="You handle unsupported or ambiguous requests. Call fallback_response.",
+            tools=[fallback_response],
+        )
+        payment_agent = OpenAIAgent(
+            name="PaymentSystemAgent",
+            model=self.model,
+            instructions=(
+                "You perform concrete payment-system actions using tools. "
+                "For transfers, only execute transfer_money after PolicyAgent has approved. "
+                "After an approved transfer or approved payment request creates a transaction, "
+                "handoff to FraudDetectionAgent for risk review."
+            ),
+            tools=[
+                create_user,
+                check_balance,
+                transfer_money,
+                request_payment,
+                approve_payment_request,
+                reject_payment_request,
+                show_transactions,
+            ],
+            handoffs=[fraud_agent, fallback_agent],
+        )
+        policy_agent = OpenAIAgent(
+            name="PolicyAgent",
+            model=self.model,
+            instructions=(
+                "You evaluate transfer policy before money moves. "
+                "Call check_transfer_policy. If approved, handoff to PaymentSystemAgent. "
+                "If rejected, stop after explaining the policy result."
+            ),
+            tools=[check_transfer_policy],
+            handoffs=[payment_agent, fallback_agent],
+        )
+        intake_agent = OpenAIAgent(
+            name="OrchestratorAgent",
+            model=self.model,
+            instructions=(
+                "You are the entrypoint for a Bit-like payment assistant. "
+                "Infer the user's intent from natural language without keyword rules. "
+                "Use handoffs instead of performing specialist work yourself: "
+                "handoff transfer requests to PolicyAgent, payment operations to PaymentSystemAgent, "
+                "fraud questions to FraudDetectionAgent, security questions to SecurityAgent, "
+                "explanation questions to ExplanationAgent, and unclear requests to FallbackAgent. "
+                "If a required field is missing, ask a concise follow-up question instead of guessing."
+            ),
+            handoffs=[policy_agent, payment_agent, fraud_agent, security_agent, explanation_agent, fallback_agent],
+        )
+        self.agents = {
+            "intake": intake_agent,
+            "policy": policy_agent,
+            "payment": payment_agent,
+            "fraud": fraud_agent,
+            "security": security_agent,
+            "explanation": explanation_agent,
+            "fallback": fallback_agent,
+        }
+
+
 class OrchestratorAgent:
     def __init__(self):
         self.chatbot = OpenAIChatbot()
@@ -721,12 +978,36 @@ class OrchestratorAgent:
         self.explanation_agent = ExplanationAgent(self.chatbot)
         self.critic_agent = CriticAgent()
         self.fallback_agent = FallbackAgent()
+        self.openai_agent_runtime = OpenAIAgentRuntime(
+            self.payment_system,
+            self.memory,
+            self.policy_agent,
+            self.fraud_agent,
+            self.security_agent,
+            self.explanation_agent,
+            self.fallback_agent,
+            self.chatbot.model,
+        )
 
     def run_free_speech(self, message: str) -> AgentResult:
+        if self.openai_agent_runtime.enabled:
+            try:
+                result = self.openai_agent_runtime.run(message)
+                return self._finalize_result(message, "openaiAgentsHandoff", "OpenAIAgentRuntime", result, {})
+            except Exception as e:
+                fallback_note = {"openai_agents_error": str(e), "inference": "local_fallback"}
+        else:
+            fallback_note = {
+                "inference": "local_fallback",
+                "openai_agents_disabled_reason": self.openai_agent_runtime.disabled_reason,
+            }
+
         parsed_result = self.free_speech_parser.parse(message, self.memory)
         parsed = parsed_result.output
         if parsed["intent"] == "unknown":
-            return self.fallback_agent.handle(message)
+            result = self.fallback_agent.handle(message)
+            result.metadata = {**(result.metadata or {}), **fallback_note}
+            return result
         if parsed["missing_fields"]:
             return AgentResult(
                 "FreeSpeechParserAgent",
@@ -737,8 +1018,11 @@ class OrchestratorAgent:
                     "parsed_parameters": parsed["parameters"],
                 },
                 parsed_result.confidence,
+                fallback_note,
             )
-        return self.run(parsed["intent"], **parsed["parameters"])
+        result = self.run(parsed["intent"], **parsed["parameters"])
+        result.metadata = {**(result.metadata or {}), **fallback_note}
+        return result
 
     def run(self, message: str, **kwargs: Any) -> AgentResult:
         intent = message if message in ToolSelector.MAP else self.router.route(message).output
@@ -785,6 +1069,18 @@ class OrchestratorAgent:
         else:
             result = self.fallback_agent.handle(message)
 
+        return self._finalize_result(message, intent, selected_tool, result, internal_parameters, kwargs)
+
+    def _finalize_result(
+        self,
+        message: str,
+        intent: str,
+        selected_tool: str,
+        result: AgentResult,
+        internal_parameters: Dict[str, Any],
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> AgentResult:
+        kwargs = kwargs or {}
         critic = self.critic_agent.review(result)
         if critic.output["needs_fallback"]:
             result = self.fallback_agent.handle(message)

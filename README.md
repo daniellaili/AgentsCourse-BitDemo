@@ -11,9 +11,12 @@ It includes:
 - `FraudDetectionAgent`, `SecurityAgent`, `ExplanationAgent`, `CriticAgent`, and `FallbackAgent`
 - two advanced elements: `PolicyAgent` and JSON save/load
 - a demo with the required assignment test cases
-- optional OpenAI SDK usage for chatbot-style routing/explanations
+- OpenAI Agents SDK usage for natural-language inference, tools, and handoffs
+- deterministic local fallback logic when no API key or Agents SDK package is available
 
 ## Setup
+
+Use Python 3.10 or newer for the OpenAI Agents SDK path. Older Python versions can still run the deterministic fallback.
 
 Create `.env` from `.env.example` and set your OpenAI key:
 
@@ -22,13 +25,13 @@ OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
-Install the SDK:
+Install the SDKs:
 
 ```bash
-pip install openai
+pip install -r requirements.txt
 ```
 
-The project still runs without an API key or without the SDK installed. In that case it uses deterministic local fallback logic.
+With `OPENAI_API_KEY` and `openai-agents` installed, free-speech requests are handled by OpenAI SDK agents that use tools and handoffs. The deterministic parser/router is kept only as a fallback when the API key or Agents SDK package is unavailable.
 
 ## Run
 
@@ -61,4 +64,4 @@ Send 150 from U001 to U002
 Explain the last transaction
 ```
 
-`FreeSpeechParserAgent` parses the message into an intent and parameter schema, then `OrchestratorAgent` routes it to the matching agent. If the parser is missing a required field, the CLI asks only for that field.
+In normal API-backed mode, `OrchestratorAgent` delegates to OpenAI SDK agents with handoffs between policy, payment, fraud, security, explanation, and fallback agents. If the API-backed agent runtime is unavailable, `FreeSpeechParserAgent` uses the local fallback parser and the CLI asks only for missing fields.
