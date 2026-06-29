@@ -69,6 +69,7 @@ def main() -> None:
 
         print("\nAgent>")
         print(json.dumps(compact(result), indent=2, ensure_ascii=False))
+        orch.payment_system.save_to_json("payment_state.json")
 
 
 if __name__ == "__main__":
