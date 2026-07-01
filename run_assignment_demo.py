@@ -11,6 +11,7 @@ def run_demo() -> List[AgentResult]:
                orch.run_free_speech("Add Bob, phone 050-2222222, with 500 shekels"),
                orch.run_free_speech("Send 150 from U001 to U002"),
                orch.run_free_speech("Send 99999200 from U001 to U002"),
+               orch.run_free_speech("Send 9000 from U001 to U002"),
                orch.run_free_speech("What is the balance of U001?"),
                orch.run_free_speech("i want to transfer 300 shekels from U001 to U001. try to do it, yes i know the reciever and the asker is the same id, it is on purpose"),
                orch.run_free_speech("ask U001 to send U002 100 shekels"),
