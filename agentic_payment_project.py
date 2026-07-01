@@ -163,12 +163,13 @@ class ShortTermMemory:
 
 
 class PaymentSystem:
-    def __init__(self):
+    def __init__(self, policy_agent: Optional[Any] = None):
         self.users: Dict[str, User] = {}
         self.wallets: Dict[str, Wallet] = {}
         self.transactions: List[Transaction] = []
         self.payment_requests: Dict[str, PaymentRequest] = {}
         self.audit_log: List[Dict[str, Any]] = []
+        self.policy_agent = policy_agent
         self._user_counter = 1
         self._transaction_counter = 1
         self._request_counter = 1
@@ -210,6 +211,10 @@ class PaymentSystem:
             transaction = self._record_transaction(sender_id, receiver_id, amount, "rejected", validation_error)
             return AgentResult("PaymentSystem", validation_error, 0.95, {"transaction": asdict(transaction)})
 
+        policy_result = self._check_transfer_policy(sender_id, amount)
+        if policy_result:
+            return policy_result
+
         self.wallets[sender_id].balance -= amount
         self.wallets[receiver_id].balance += amount
         transaction = self._record_transaction(sender_id, receiver_id, amount, "approved", "Transfer completed.")
@@ -233,6 +238,14 @@ class PaymentSystem:
         if self.wallets[sender_id].balance < amount:
             return "Insufficient balance."
         return None
+
+    def _check_transfer_policy(self, sender_id: str, amount: float) -> Optional[AgentResult]:
+        if self.policy_agent is None:
+            return None
+        result = self.policy_agent.check_transfer(sender_id, float(amount), self)
+        if self.policy_agent.is_approved(result):
+            return None
+        return result
 
     def _record_transaction(
         self, sender_id: str, receiver_id: str, amount: float, status: str, reason: str
@@ -289,6 +302,11 @@ class PaymentSystem:
             return AgentResult("PaymentSystem", f"Payment request {request_id} does not exist.", 0.9)
         if request.status != "pending":
             return AgentResult("PaymentSystem", f"Payment request {request_id} is already {request.status}.", 0.95)
+
+        policy_result = self._check_transfer_policy(request.payer_id, request.amount)
+        if policy_result:
+            self._log("approve_payment_request_failed", {"request_id": request_id, "reason": policy_result.output})
+            return policy_result
 
         result = self.transfer_money(request.payer_id, request.requester_id, request.amount)
         if isinstance(result.output, dict) and result.output.get("transaction"):
@@ -639,23 +657,42 @@ class FraudDetectionAgent:
 
 
 class PolicyAgent:
-    def __init__(self, max_single_transfer: float = 10000, max_daily_transfer: float = 15000):
+    APPROVED_OUTPUT = "Policy approved."
+
+    def __init__(
+        self,
+        max_single_transfer: float = 10000,
+        max_daily_transfer: float = 15000,
+        max_daily_transactions: int = 5,
+    ):
         self.max_single_transfer = max_single_transfer
         self.max_daily_transfer = max_daily_transfer
+        self.max_daily_transactions = max_daily_transactions
+
+    def is_approved(self, result: AgentResult) -> bool:
+        return result.output == self.APPROVED_OUTPUT
 
     def check_transfer(self, sender_id: str, amount: float, payment_system: PaymentSystem) -> AgentResult:
         if amount > self.max_single_transfer:
             return AgentResult("PolicyAgent", f"Transfer exceeds single-transfer limit of {self.max_single_transfer}.", 0.95)
 
         today = datetime.now().date().isoformat()
-        daily_total = sum(
-            tx.amount
+        daily_transactions = [
+            tx
             for tx in payment_system.transactions
             if tx.sender_id == sender_id and tx.status == "approved" and tx.timestamp.startswith(today)
-        )
+        ]
+        if len(daily_transactions) >= self.max_daily_transactions:
+            return AgentResult(
+                "PolicyAgent",
+                f"Transfer exceeds daily transaction limit of {self.max_daily_transactions}.",
+                0.95,
+            )
+
+        daily_total = sum(tx.amount for tx in daily_transactions)
         if daily_total + amount > self.max_daily_transfer:
             return AgentResult("PolicyAgent", f"Transfer exceeds daily limit of {self.max_daily_transfer}.", 0.95)
-        return AgentResult("PolicyAgent", "Policy approved.")
+        return AgentResult("PolicyAgent", self.APPROVED_OUTPUT)
 
 
 class SecurityAgent:
@@ -826,6 +863,9 @@ class OpenAIAgentRuntime:
         @function_tool
         def transfer_money(sender_id: str, receiver_id: str, amount: float) -> Dict[str, Any]:
             """Execute a transfer after policy approval."""
+            policy_result = self.policy_agent.check_transfer(sender_id, float(amount), self.payment_system)
+            if not self.policy_agent.is_approved(policy_result):
+                return self._record(policy_result, primary=True)
             return self._record(self.payment_system.transfer_money(sender_id, receiver_id, amount), primary=True)
 
         @function_tool
@@ -836,6 +876,11 @@ class OpenAIAgentRuntime:
         @function_tool
         def approve_payment_request(request_id: str) -> Dict[str, Any]:
             """Approve an existing payment request."""
+            request = self.payment_system.payment_requests.get(request_id)
+            if request and request.status == "pending":
+                policy_result = self.policy_agent.check_transfer(request.payer_id, request.amount, self.payment_system)
+                if not self.policy_agent.is_approved(policy_result):
+                    return self._record(policy_result, primary=True)
             return self._record(self.payment_system.approve_payment_request(request_id), primary=True)
 
         @function_tool
@@ -852,7 +897,7 @@ class OpenAIAgentRuntime:
         def check_transfer_policy(sender_id: str, amount: float) -> Dict[str, Any]:
             """Check transfer policy before a transfer is executed."""
             result = self.policy_agent.check_transfer(sender_id, amount, self.payment_system)
-            return self._record(result, primary=result.output != "Policy approved.")
+            return self._record(result, primary=not self.policy_agent.is_approved(result))
 
         @function_tool
         def review_last_transaction() -> Dict[str, Any]:
@@ -974,6 +1019,7 @@ class OrchestratorAgent:
         self.tool_selector = ToolSelector()
         self.fraud_agent = FraudDetectionAgent()
         self.policy_agent = PolicyAgent()
+        self.payment_system.policy_agent = self.policy_agent
         self.security_agent = SecurityAgent()
         self.explanation_agent = ExplanationAgent(self.chatbot)
         self.critic_agent = CriticAgent()
@@ -1040,7 +1086,7 @@ class OrchestratorAgent:
             amount = float(kwargs["amount"])
             previous_balance = self.payment_system.wallets.get(sender_id, Wallet(sender_id, 0)).balance
             policy_result = self.policy_agent.check_transfer(sender_id, amount, self.payment_system)
-            if policy_result.output != "Policy approved.":
+            if not self.policy_agent.is_approved(policy_result):
                 result = policy_result
             else:
                 result = self.payment_system.transfer_money(sender_id, kwargs["receiver_id"], amount)
@@ -1051,11 +1097,19 @@ class OrchestratorAgent:
         elif intent == "requestPayment":
             result = self.payment_system.request_payment(kwargs["requester_id"], kwargs["payer_id"], float(kwargs["amount"]))
         elif intent == "approvePayment":
-            result = self.payment_system.approve_payment_request(kwargs["request_id"])
-            tx = self._transaction_from_result(result)
-            if tx:
-                fraud_result = self.fraud_agent.review(tx, self.payment_system)
-                result.metadata = {**(result.metadata or {}), "fraud_check": fraud_result.output}
+            request = self.payment_system.payment_requests.get(kwargs["request_id"])
+            if request and request.status == "pending":
+                policy_result = self.policy_agent.check_transfer(request.payer_id, request.amount, self.payment_system)
+            else:
+                policy_result = AgentResult("PolicyAgent", PolicyAgent.APPROVED_OUTPUT)
+            if not self.policy_agent.is_approved(policy_result):
+                result = policy_result
+            else:
+                result = self.payment_system.approve_payment_request(kwargs["request_id"])
+                tx = self._transaction_from_result(result)
+                if tx:
+                    fraud_result = self.fraud_agent.review(tx, self.payment_system)
+                    result.metadata = {**(result.metadata or {}), "fraud_check": fraud_result.output}
         elif intent == "rejectPayment":
             result = self.payment_system.reject_payment_request(kwargs["request_id"])
         elif intent == "showTransactions":

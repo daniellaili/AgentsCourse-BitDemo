@@ -23,6 +23,7 @@ def run_demo() -> List[AgentResult]:
                orch.run_free_speech("Send 100 from U001 to U002"),
                orch.run_free_speech("Send 200 from U001 to U002"),
                orch.run_free_speech("Send 510 from U001 to U002"),
+               orch.run_free_speech("What is the least suspicious transactions for user U001"),
                orch.run_free_speech("Run a security review"), orch.payment_system.save_to_json("payment_state.json")]
     # request_id = results[-1].output["request_id"]
     # results.append(orch.run("approve payment", request_id=request_id))
