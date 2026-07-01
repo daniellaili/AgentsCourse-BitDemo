@@ -777,6 +777,7 @@ class OpenAIAgentRuntime:
         security_agent: SecurityAgent,
         explanation_agent: ExplanationAgent,
         fallback_agent: FallbackAgent,
+        critic_agent: CriticAgent,
         model: Optional[str] = None,
     ):
         load_env_file()
@@ -1031,7 +1032,9 @@ class OpenAIAgentRuntime:
                 "You are the entrypoint for a Bit-like payment assistant. "
                 "Infer the user's intent from natural language without keyword rules. "
                 "Use handoffs instead of performing specialist work yourself: "
-                "handoff direct transfer requests and payment-request approvals to PolicyAgent, "
+                "handoff direct transfer requests and payment-request approvals to PolicyAgent, but not user creations"
+                "requests. "
+                "handoff user create requests to PaymentSystemAgent,"
                 "handoff non-transfer payment operations to PaymentSystemAgent, "
                 "fraud questions to FraudDetectionAgent, security questions to SecurityAgent, "
                 "explanation questions to ExplanationAgent, and unclear requests to FallbackAgent. "
@@ -1074,6 +1077,7 @@ class OrchestratorAgent:
             self.security_agent,
             self.explanation_agent,
             self.fallback_agent,
+            self.critic_agent,
             self.chatbot.model,
         )
 
