@@ -737,7 +737,11 @@ class ExplanationAgent:
 class CriticAgent:
     def review(self, result: AgentResult) -> AgentResult:
         needs_fallback = result.confidence < 0.5 or result.output in (None, "", {})
-        output = {"needs_fallback": needs_fallback, "reviewed_agent": result.agent_name}
+        output = {
+            "approved": not needs_fallback,
+            "needs_fallback": needs_fallback,
+            "reviewed_agent": result.agent_name,
+        }
         return AgentResult("CriticAgent", output, 0.9)
 
 
@@ -790,6 +794,7 @@ class OpenAIAgentRuntime:
         self.security_agent = security_agent
         self.explanation_agent = explanation_agent
         self.fallback_agent = fallback_agent
+        self.critic_agent = critic_agent
         self.tool_results: List[AgentResult] = []
         self.handoff_events: List[Dict[str, str]] = []
         self.primary_result: Optional[AgentResult] = None
@@ -956,26 +961,54 @@ class OpenAIAgentRuntime:
             """Return a fallback response when the request is unsupported or ambiguous."""
             return self._record(self.fallback_agent.handle(original_message), primary=True)
 
+        @function_tool
+        def review_task_response() -> Dict[str, Any]:
+            """Review the primary task-agent response and mark whether the critic approves it."""
+            result_to_review = self.primary_result or AgentResult("OpenAIAgentRuntime", None, 0.0)
+            result = self.critic_agent.review(result_to_review)
+            critic_output = result.output if isinstance(result.output, dict) else {}
+            if self.primary_result is not None:
+                if not critic_output.get("approved", True):
+                    self.primary_result.output = OrchestratorAgent._add_critic_rejection_note(self.primary_result.output)
+                self.primary_result.metadata = {
+                    **(self.primary_result.metadata or {}),
+                    "critic_review": critic_output,
+                }
+            return self._record(result, primary=False)
+
+        critic_agent = OpenAIAgent(
+            name="CriticAgent",
+            model=self.model,
+            instructions=(
+                "You review the already-completed task response. "
+                "Call review_task_response exactly once. "
+                "Do not perform payment tasks yourself."
+            ),
+            tools=[review_task_response],
+        )
         fraud_agent = OpenAIAgent(
             name="FraudDetectionAgent",
             model=self.model,
             instructions=(
                 "You review only completed or recent transactions for fraud risk. "
-                "Call review_last_transaction, then summarize the risk briefly."
+                "Call review_last_transaction, then hand off to CriticAgent."
             ),
             tools=[review_last_transaction],
+            handoffs=[critic_agent],
         )
         security_agent = OpenAIAgent(
             name="SecurityAgent",
             model=self.model,
-            instructions="You run system security reviews. Call run_security_review.",
+            instructions="You run system security reviews. Call run_security_review, then hand off to CriticAgent.",
             tools=[run_security_review],
+            handoffs=[critic_agent],
         )
         explanation_agent = OpenAIAgent(
             name="ExplanationAgent",
             model=self.model,
-            instructions="You explain the latest remembered action. Call explain_last_action.",
+            instructions="You explain the latest remembered action. Call explain_last_action, then hand off to CriticAgent.",
             tools=[explain_last_action],
+            handoffs=[critic_agent],
         )
         fallback_agent = OpenAIAgent(
             name="FallbackAgent",
@@ -988,6 +1021,7 @@ class OpenAIAgentRuntime:
             model=self.model,
             instructions=(
                 "You perform non-transfer payment-system actions using tools. "
+                "After the payment-system tool returns, hand off to CriticAgent. "
                 "Do not handle direct money transfers or payment-request approvals; those must go through PolicyAgent."
             ),
             tools=[
@@ -997,7 +1031,7 @@ class OpenAIAgentRuntime:
                 reject_payment_request,
                 show_transactions,
             ],
-            handoffs=[fallback_agent],
+            handoffs=[critic_agent, fallback_agent],
         )
         transfer_execution_agent = OpenAIAgent(
             name="TransferExecutionAgent",
@@ -1006,10 +1040,11 @@ class OpenAIAgentRuntime:
                 "You execute money-moving actions only after PolicyAgent has approved them. "
                 "For a direct transfer, call transfer_money. "
                 "For approval of a pending payment request, call approve_payment_request. "
-                "After an approved transfer creates a transaction, handoff to FraudDetectionAgent for risk review."
+                "After an approved transfer creates a transaction, handoff to FraudDetectionAgent for risk review. "
+                "If no fraud review is needed, hand off to CriticAgent after the execution tool returns."
             ),
             tools=[transfer_money, approve_payment_request],
-            handoffs=[fraud_agent, fallback_agent],
+            handoffs=[fraud_agent, critic_agent, fallback_agent],
         )
         policy_agent = OpenAIAgent(
             name="PolicyAgent",
@@ -1019,12 +1054,13 @@ class OpenAIAgentRuntime:
                 "For direct transfers, call check_transfer_policy. "
                 "For payment request approvals, call check_payment_request_policy. "
                 "If approved, handoff to TransferExecutionAgent. "
-                "If rejected, stop after explaining the policy result. "
+                "If rejected, hand off to CriticAgent after explaining the policy result. "
                 "Never execute transfers yourself."
             ),
             tools=[check_transfer_policy, check_payment_request_policy],
-            handoffs=[transfer_execution_agent, fallback_agent],
+            handoffs=[transfer_execution_agent, critic_agent, fallback_agent],
         )
+
         intake_agent = OpenAIAgent(
             name="OrchestratorAgent",
             model=self.model,
@@ -1051,6 +1087,7 @@ class OpenAIAgentRuntime:
             "security": security_agent,
             "explanation": explanation_agent,
             "fallback": fallback_agent,
+            "critic": critic_agent,
         }
 
 
@@ -1182,12 +1219,14 @@ class OrchestratorAgent:
     ) -> AgentResult:
         kwargs = kwargs or {}
         critic = self.critic_agent.review(result)
-        if critic.output["needs_fallback"]:
-            result = self.fallback_agent.handle(message)
+        critic_output = critic.output if isinstance(critic.output, dict) else {}
+        if not critic_output.get("approved", True):
+            result.output = self._add_critic_rejection_note(result.output)
 
         result.metadata = {
             **(result.metadata or {}),
             "parameters": internal_parameters,
+            "critic_review": critic_output,
         }
         self.memory.update(
             intent,
@@ -1201,6 +1240,21 @@ class OrchestratorAgent:
             {"message": message, "intent": intent, "tool": selected_tool, "agent": result.agent_name},
         )
         return result
+
+    @staticmethod
+    def _add_critic_rejection_note(output: Any) -> Any:
+        note = "Critic agent did not approve."
+        if isinstance(output, dict):
+            if output.get("critic_note") == note:
+                return output
+            return {**output, "critic_note": note}
+        if isinstance(output, list):
+            return {"result": output, "critic_note": note}
+        if output in (None, ""):
+            return note
+        if isinstance(output, str) and note in output:
+            return output
+        return f"{output}\n{note}"
 
     @staticmethod
     def _internal_parameters_for_intent(intent: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
