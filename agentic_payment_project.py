@@ -14,9 +14,11 @@ try:
     from agents import Agent as OpenAIAgent
     from agents import Runner as OpenAIAgentRunner
     from agents import function_tool
-except ImportError:
+    from agents import RunHooks as OpenAIRunHooks
+except Exception:
     OpenAIAgent = None
     OpenAIAgentRunner = None
+    OpenAIRunHooks = None
 
     def function_tool(func):
         return func
@@ -788,6 +790,7 @@ class OpenAIAgentRuntime:
         self.explanation_agent = explanation_agent
         self.fallback_agent = fallback_agent
         self.tool_results: List[AgentResult] = []
+        self.handoff_events: List[Dict[str, str]] = []
         self.primary_result: Optional[AgentResult] = None
         self.agents: Dict[str, Any] = {}
         self.disabled_reason = self._disabled_reason()
@@ -809,8 +812,10 @@ class OpenAIAgentRuntime:
             raise RuntimeError("OpenAI Agents SDK runtime is not available.")
 
         self.tool_results = []
+        self.handoff_events = []
         self.primary_result = None
-        result = OpenAIAgentRunner.run_sync(self.agents["intake"], message)
+        hooks = self._handoff_hooks()
+        result = OpenAIAgentRunner.run_sync(self.agents["intake"], message, hooks=hooks)
         final_text = str(getattr(result, "final_output", "")).strip()
 
         if self.primary_result is not None:
@@ -824,9 +829,27 @@ class OpenAIAgentRuntime:
             **(output.metadata or {}),
             "sdk_final_output": final_text,
             "inference": "openai_agents_sdk",
-            "handoffs": self._handoff_names(),
+            "handoffs": self.handoff_events,
+            "tool_results": self._handoff_names(),
         }
         return output
+
+    def _handoff_hooks(self) -> Optional[Any]:
+        if OpenAIRunHooks is None:
+            return None
+
+        runtime = self
+
+        class HandoffRecorder(OpenAIRunHooks):
+            async def on_handoff(self, context: Any, from_agent: Any, to_agent: Any) -> None:
+                runtime.handoff_events.append(
+                    {
+                        "from": getattr(from_agent, "name", str(from_agent)),
+                        "to": getattr(to_agent, "name", str(to_agent)),
+                    }
+                )
+
+        return HandoffRecorder()
 
     def _record(self, result: AgentResult, primary: bool = False) -> Dict[str, Any]:
         self.tool_results.append(result)
@@ -862,10 +885,7 @@ class OpenAIAgentRuntime:
 
         @function_tool
         def transfer_money(sender_id: str, receiver_id: str, amount: float) -> Dict[str, Any]:
-            """Execute a transfer after policy approval."""
-            policy_result = self.policy_agent.check_transfer(sender_id, float(amount), self.payment_system)
-            if not self.policy_agent.is_approved(policy_result):
-                return self._record(policy_result, primary=True)
+            """Execute a transfer. This tool is only available after PolicyAgent handoff."""
             return self._record(self.payment_system.transfer_money(sender_id, receiver_id, amount), primary=True)
 
         @function_tool
@@ -875,12 +895,7 @@ class OpenAIAgentRuntime:
 
         @function_tool
         def approve_payment_request(request_id: str) -> Dict[str, Any]:
-            """Approve an existing payment request."""
-            request = self.payment_system.payment_requests.get(request_id)
-            if request and request.status == "pending":
-                policy_result = self.policy_agent.check_transfer(request.payer_id, request.amount, self.payment_system)
-                if not self.policy_agent.is_approved(policy_result):
-                    return self._record(policy_result, primary=True)
+            """Approve an existing payment request. This tool is only available after PolicyAgent handoff."""
             return self._record(self.payment_system.approve_payment_request(request_id), primary=True)
 
         @function_tool
@@ -897,6 +912,20 @@ class OpenAIAgentRuntime:
         def check_transfer_policy(sender_id: str, amount: float) -> Dict[str, Any]:
             """Check transfer policy before a transfer is executed."""
             result = self.policy_agent.check_transfer(sender_id, amount, self.payment_system)
+            return self._record(result, primary=not self.policy_agent.is_approved(result))
+
+        @function_tool
+        def check_payment_request_policy(request_id: str) -> Dict[str, Any]:
+            """Check transfer policy before a pending payment request is approved."""
+            request = self.payment_system.payment_requests.get(request_id)
+            if request is None:
+                return self._record(AgentResult("PolicyAgent", f"Payment request {request_id} does not exist.", 0.9), primary=True)
+            if request.status != "pending":
+                return self._record(
+                    AgentResult("PolicyAgent", f"Payment request {request_id} is already {request.status}.", 0.95),
+                    primary=True,
+                )
+            result = self.policy_agent.check_transfer(request.payer_id, request.amount, self.payment_system)
             return self._record(result, primary=not self.policy_agent.is_approved(result))
 
         @function_tool
@@ -957,20 +986,28 @@ class OpenAIAgentRuntime:
             name="PaymentSystemAgent",
             model=self.model,
             instructions=(
-                "You perform concrete payment-system actions using tools. "
-                "For transfers, only execute transfer_money after PolicyAgent has approved. "
-                "After an approved transfer or approved payment request creates a transaction, "
-                "handoff to FraudDetectionAgent for risk review."
+                "You perform non-transfer payment-system actions using tools. "
+                "Do not handle direct money transfers or payment-request approvals; those must go through PolicyAgent."
             ),
             tools=[
                 create_user,
                 check_balance,
-                transfer_money,
                 request_payment,
-                approve_payment_request,
                 reject_payment_request,
                 show_transactions,
             ],
+            handoffs=[fallback_agent],
+        )
+        transfer_execution_agent = OpenAIAgent(
+            name="TransferExecutionAgent",
+            model=self.model,
+            instructions=(
+                "You execute money-moving actions only after PolicyAgent has approved them. "
+                "For a direct transfer, call transfer_money. "
+                "For approval of a pending payment request, call approve_payment_request. "
+                "After an approved transfer creates a transaction, handoff to FraudDetectionAgent for risk review."
+            ),
+            tools=[transfer_money, approve_payment_request],
             handoffs=[fraud_agent, fallback_agent],
         )
         policy_agent = OpenAIAgent(
@@ -978,11 +1015,14 @@ class OpenAIAgentRuntime:
             model=self.model,
             instructions=(
                 "You evaluate transfer policy before money moves. "
-                "Call check_transfer_policy. If approved, handoff to PaymentSystemAgent. "
-                "If rejected, stop after explaining the policy result."
+                "For direct transfers, call check_transfer_policy. "
+                "For payment request approvals, call check_payment_request_policy. "
+                "If approved, handoff to TransferExecutionAgent. "
+                "If rejected, stop after explaining the policy result. "
+                "Never execute transfers yourself."
             ),
-            tools=[check_transfer_policy],
-            handoffs=[payment_agent, fallback_agent],
+            tools=[check_transfer_policy, check_payment_request_policy],
+            handoffs=[transfer_execution_agent, fallback_agent],
         )
         intake_agent = OpenAIAgent(
             name="OrchestratorAgent",
@@ -991,7 +1031,8 @@ class OpenAIAgentRuntime:
                 "You are the entrypoint for a Bit-like payment assistant. "
                 "Infer the user's intent from natural language without keyword rules. "
                 "Use handoffs instead of performing specialist work yourself: "
-                "handoff transfer requests to PolicyAgent, payment operations to PaymentSystemAgent, "
+                "handoff direct transfer requests and payment-request approvals to PolicyAgent, "
+                "handoff non-transfer payment operations to PaymentSystemAgent, "
                 "fraud questions to FraudDetectionAgent, security questions to SecurityAgent, "
                 "explanation questions to ExplanationAgent, and unclear requests to FallbackAgent. "
                 "If a required field is missing, ask a concise follow-up question instead of guessing."
@@ -1002,6 +1043,7 @@ class OpenAIAgentRuntime:
             "intake": intake_agent,
             "policy": policy_agent,
             "payment": payment_agent,
+            "transfer_execution": transfer_execution_agent,
             "fraud": fraud_agent,
             "security": security_agent,
             "explanation": explanation_agent,
