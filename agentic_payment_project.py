@@ -8,17 +8,21 @@ import json
 import os
 import re
 import sys
-from openai import OpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 
 try:
     from agents import Agent as OpenAIAgent
     from agents import Runner as OpenAIAgentRunner
     from agents import function_tool
     from agents import RunHooks as OpenAIRunHooks
+    from agents import set_default_openai_client
+    from agents import set_tracing_disabled as set_openai_tracing_disabled
 except Exception:
     OpenAIAgent = None
     OpenAIAgentRunner = None
     OpenAIRunHooks = None
+    set_default_openai_client = None
+    set_openai_tracing_disabled = None
 
     def function_tool(func):
         return func
@@ -26,17 +30,70 @@ except Exception:
 DEFAULT_MODEL = "gpt-4.1-mini"
 
 
+def env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configure_openai_environment() -> None:
+    """Apply local SDK defaults after .env is loaded."""
+    use_proxy = env_flag_enabled("OPENAI_USE_PROXY")
+    if not use_proxy:
+        for proxy_var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            os.environ.pop(proxy_var, None)
+
+    ca_bundle = os.getenv("OPENAI_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        os.environ.setdefault("SSL_CERT_FILE", ca_bundle)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle)
+    else:
+        try:
+            import truststore
+
+            truststore.inject_into_ssl()
+        except Exception:
+            try:
+                import certifi
+
+                certifi_bundle = certifi.where()
+                os.environ.setdefault("SSL_CERT_FILE", certifi_bundle)
+                os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi_bundle)
+            except Exception:
+                pass
+
+    if not env_flag_enabled("OPENAI_AGENTS_TRACING"):
+        os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+        if set_openai_tracing_disabled is not None:
+            set_openai_tracing_disabled(True)
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if api_key and set_default_openai_client is not None:
+        set_default_openai_client(
+            AsyncOpenAI(
+                api_key=api_key,
+                http_client=DefaultAsyncHttpxClient(trust_env=use_proxy),
+            ),
+            use_for_tracing=False,
+        )
+
+
 def load_env_file(path: str = ".env") -> None:
     env_path = Path(path)
-    if not env_path.exists():
-        return
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    configure_openai_environment()
 
 
 class OpenAIChatbot:
@@ -53,7 +110,10 @@ class OpenAIChatbot:
             return
 
         try:
-            self.client = OpenAI(api_key=api_key)
+            self.client = OpenAI(
+                api_key=api_key,
+                http_client=DefaultHttpxClient(trust_env=env_flag_enabled("OPENAI_USE_PROXY")),
+            )
             self.enabled = True
         except Exception as e:
             self.client = None
@@ -821,7 +881,7 @@ class OpenAIAgentRuntime:
         self.handoff_events = []
         self.primary_result = None
         hooks = self._handoff_hooks()
-        result = OpenAIAgentRunner.run_sync(self.agents["intake"], message, hooks=hooks)
+        result = OpenAIAgentRunner.run_sync(self.agents["intake"], self._message_with_context(message), hooks=hooks)
         final_text = str(getattr(result, "final_output", "")).strip()
 
         if self.primary_result is not None:
@@ -839,6 +899,33 @@ class OpenAIAgentRuntime:
             "tool_results": self._handoff_names(),
         }
         return output
+
+    def _message_with_context(self, message: str) -> str:
+        context: Dict[str, Any] = {
+            "current_user_message": message,
+            "last_referenced_user_id": self.memory.last_user,
+            "known_users": {
+                user_id: {
+                    "name": user.name,
+                    "phone_number": user.phone_number,
+                }
+                for user_id, user in self.payment_system.users.items()
+            },
+        }
+        if self.memory.last_transaction is not None:
+            context["last_transaction"] = asdict(self.memory.last_transaction)
+        if self.memory.last_payment_request is not None:
+            context["last_payment_request"] = asdict(self.memory.last_payment_request)
+        if self.memory.recent_actions:
+            context["recent_actions"] = self.memory.recent_actions[-5:]
+
+        return (
+            "Use this payment-assistant memory context to resolve references such as "
+            "'it', 'its', 'that user', 'the last transaction', or omitted user IDs. "
+            "Do not invent IDs; if the context identifies the referenced entity, use it. "
+            "The actual user request is in current_user_message.\n"
+            f"{json.dumps(context, ensure_ascii=False)}"
+        )
 
     def _handoff_hooks(self) -> Optional[Any]:
         if OpenAIRunHooks is None:
@@ -1067,6 +1154,8 @@ class OpenAIAgentRuntime:
             instructions=(
                 "You are the entrypoint for a Bit-like payment assistant. "
                 "Infer the user's intent from natural language without keyword rules. "
+                "Use the supplied memory context to resolve follow-up references like its balance, that user, "
+                "or the last transaction. "
                 "Use handoffs instead of performing specialist work yourself: "
                 "handoff direct transfer requests and payment-request approvals to PolicyAgent, but not user creations"
                 "requests. "
@@ -1119,39 +1208,11 @@ class OrchestratorAgent:
         )
 
     def run_free_speech(self, message: str) -> AgentResult:
-        if self.openai_agent_runtime.enabled:
-            try:
-                result = self.openai_agent_runtime.run(message)
-                return self._finalize_result(message, "openaiAgentsHandoff", "OpenAIAgentRuntime", result, {})
-            except Exception as e:
-                fallback_note = {"openai_agents_error": str(e), "inference": "local_fallback"}
-        else:
-            fallback_note = {
-                "inference": "local_fallback",
-                "openai_agents_disabled_reason": self.openai_agent_runtime.disabled_reason,
-            }
+        if not self.openai_agent_runtime.enabled:
+            raise RuntimeError(f"OpenAI Agents SDK runtime is not available: {self.openai_agent_runtime.disabled_reason}")
 
-        parsed_result = self.free_speech_parser.parse(message, self.memory)
-        parsed = parsed_result.output
-        if parsed["intent"] == "unknown":
-            result = self.fallback_agent.handle(message)
-            result.metadata = {**(result.metadata or {}), **fallback_note}
-            return result
-        if parsed["missing_fields"]:
-            return AgentResult(
-                "FreeSpeechParserAgent",
-                {
-                    "message": "I understood the request but need more details.",
-                    "intent": parsed["intent"],
-                    "missing_fields": parsed["missing_fields"],
-                    "parsed_parameters": parsed["parameters"],
-                },
-                parsed_result.confidence,
-                fallback_note,
-            )
-        result = self.run(parsed["intent"], **parsed["parameters"])
-        result.metadata = {**(result.metadata or {}), **fallback_note}
-        return result
+        result = self.openai_agent_runtime.run(message)
+        return self._finalize_result(message, "openaiAgentsHandoff", "OpenAIAgentRuntime", result, {})
 
     def run(self, message: str, **kwargs: Any) -> AgentResult:
         intent = message if message in ToolSelector.MAP else self.router.route(message).output
@@ -1231,7 +1292,7 @@ class OrchestratorAgent:
         self.memory.update(
             intent,
             result,
-            user_id=self._last_user_from_kwargs(kwargs),
+            user_id=self._last_user_from_kwargs(kwargs) or self._last_user_from_result(result),
             transaction=self._transaction_from_result(result),
             payment_request=self._payment_request_from_result(result),
         )
@@ -1285,6 +1346,30 @@ class OrchestratorAgent:
         for key in ("user_id", "sender_id", "receiver_id", "requester_id", "payer_id"):
             if key in kwargs:
                 return kwargs[key]
+        return None
+
+    @staticmethod
+    def _last_user_from_result(result: AgentResult) -> Optional[str]:
+        if isinstance(result.output, dict):
+            user_data = result.output.get("user")
+            if isinstance(user_data, dict) and user_data.get("user_id"):
+                return str(user_data["user_id"])
+            if result.output.get("user_id"):
+                return str(result.output["user_id"])
+
+        metadata = result.metadata or {}
+        tx_data = metadata.get("transaction")
+        if not tx_data and isinstance(result.output, dict):
+            tx_data = result.output.get("transaction")
+        if isinstance(tx_data, dict):
+            return tx_data.get("sender_id") or tx_data.get("receiver_id")
+
+        req_data = metadata.get("payment_request")
+        if not req_data and isinstance(result.output, dict):
+            req_data = result.output.get("payment_request")
+        if isinstance(req_data, dict):
+            return req_data.get("requester_id") or req_data.get("payer_id")
+
         return None
 
     @staticmethod
